@@ -1,14 +1,14 @@
 from PyQt6.QtWidgets import (
     QMainWindow, QTabWidget, QWidget, QVBoxLayout, QLabel, QPushButton,
-    QFileDialog, QMessageBox
+    QFileDialog, QMessageBox, QToolBar
 )
 from PyQt6.QtGui import QImage, QPixmap, QFont
 from PyQt6.QtCore import QTimer
 import cv2
-# Removed direct imports of face_recognition and numpy
-# import face_recognition
-# import numpy as np
-from face_recognition_module import load_known_faces, recognize_faces, register_face  # Added 'register_face'
+from face_recognition_module import load_known_faces, recognize_faces, register_face, register_new_face
+from database import Database
+from admin_portal import AdminPortal
+from datetime import datetime
 
 class FaceRecognitionApp(QMainWindow):
     def __init__(self):
@@ -16,8 +16,10 @@ class FaceRecognitionApp(QMainWindow):
         self.setWindowTitle("Face Recognition System")
         self.setGeometry(100, 100, 1024, 768)
 
+        self.db = Database()
+
         # Initialize variables
-        self.known_face_encodings, self.known_face_names = load_known_faces()
+        self.known_face_encodings, self.known_face_ids = load_known_faces(self.db)
         self.camera = None
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_camera)
@@ -37,6 +39,15 @@ class FaceRecognitionApp(QMainWindow):
         self.setup_registration_ui()
 
         self.apply_styles()
+
+        # Initialize toolbar
+        self.toolbar = QToolBar("Main Toolbar")
+        self.addToolBar(self.toolbar)
+        
+        # Add Admin Portal button
+        admin_btn = QPushButton("Admin Portal")
+        admin_btn.clicked.connect(self.open_admin_portal)
+        self.toolbar.addWidget(admin_btn)
 
     def apply_styles(self):
         self.setStyleSheet("""
@@ -111,7 +122,7 @@ class FaceRecognitionApp(QMainWindow):
         layout.addWidget(self.capture_button)
 
         # Faces loaded status
-        self.face_load_status = QLabel("No faces registered yet.", objectName="face_load_status")
+        self.face_load_status = QLabel(f"Registered {len(self.known_face_ids)} faces.", objectName="face_load_status")
         layout.addWidget(self.face_load_status)
 
     def start_camera(self):
@@ -138,16 +149,17 @@ class FaceRecognitionApp(QMainWindow):
                 self.stop_camera()
                 return
 
-            # Use recognize_faces function from face_recognition_module
-            annotated_frame = recognize_faces(frame, self.known_face_encodings, self.known_face_names)
-
-            # Display the frame in the QLabel
-            rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+            frame, recognized_students = recognize_faces(frame, self.db)
+            
+            # Record attendance for recognized students
+            for student_id, name in recognized_students:
+                self.record_attendance(student_id)
+                
+            # Update display
+            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
-            bytes_per_line = ch * w
-            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            pixmap = QPixmap.fromImage(qt_image)
-            self.video_label.setPixmap(pixmap)
+            qt_image = QImage(rgb_image.data, w, h, ch * w, QImage.Format.Format_RGB888)
+            self.video_label.setPixmap(QPixmap.fromImage(qt_image))
 
     def capture_face(self):
         if self.camera is None:
@@ -171,9 +183,38 @@ class FaceRecognitionApp(QMainWindow):
             if ok:
                 cv2.imwrite(name, face_image)
                 # Load and encode the new face using face_recognition_module
-                success = register_new_face(name)
+                success, msg = register_new_face(name, self.db)
                 if success:
-                    self.face_load_status.setText(f"Registered {len(self.known_face_names)} faces.")
+                    self.known_face_encodings, self.known_face_ids = load_known_faces(self.db)
+                    self.face_load_status.setText(f"Registered {len(self.known_face_ids)} faces.")
                     QMessageBox.information(self, "Success", "New face registered successfully!")
                 else:
-                    QMessageBox.warning(self, "Error", "Failed to encode face. Please try again.")
+                    QMessageBox.warning(self, "Error", msg)
+
+    def record_attendance(self, student_id):
+        # Get current active class
+        now = datetime.now()
+        self.db.cursor.execute("""
+            SELECT id FROM classes 
+            WHERE start_time <= %s AND end_time >= %s
+        """, (now, now))
+        active_class = self.db.cursor.fetchone()
+        
+        if active_class:
+            # Check if attendance already recorded
+            self.db.cursor.execute("""
+                SELECT id FROM attendance 
+                WHERE student_id = %s AND class_id = %s 
+                AND DATE(timestamp) = DATE(%s)
+            """, (student_id, active_class[0], now))
+            
+            if not self.db.cursor.fetchone():
+                self.db.cursor.execute("""
+                    INSERT INTO attendance (student_id, class_id, timestamp)
+                    VALUES (%s, %s, %s)
+                """, (student_id, active_class[0], now))
+                self.db.connection.commit()
+
+    def open_admin_portal(self):
+        self.admin = AdminPortal(self.db)  # Pass the existing Database instance
+        self.admin.show()
